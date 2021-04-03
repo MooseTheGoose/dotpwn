@@ -1,5 +1,6 @@
 @echo OFF
 
-cl corinterop.cpp CorGuids.lib MSCorEE.lib
+cl corbasic.cpp CorGuids.lib MSCorEE.lib
 echo.
-csc Test.cs
+csc HelloWorld.cs
+echo.

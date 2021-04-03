@@ -1,26 +1,140 @@
 /*
- *  A really basic unmanaged interop file to include
- *  in C# to make the whole COM interop process easier
- *  and less shim-y and excruciating.
- *
- *  Compile with 'cl corinterop.cpp CorGuids.lib MSCorEE.lib'
+ *  File to make DLL which allows C++ to interop with
+ *  C#. It works in C++, but is not working in C#
+ *  for some oddball reason...
  */
 
 #include <windows.h>
 #include <cor.h>
 #include <CorDebug.h>
 #include <MetaHost.h>
-#include <stdlib.h>
 #include <stdio.h>
 
-/* So much pain */
-class CorInteropManagedCallback : ICorDebugManagedCallback2 , ICorDebugManagedCallback {
+union CorBasicEvent;
+
+enum CorBasicEventType {
+  CBEV_NEWPROC,
+  CBEV_BREAK,
+  CBEV_BREAKPOINT,
+  CBEV_DATABREAKPOINT,
+};
+
+struct CorBasicNewProcessEvent {
+  int type;
+  ICorDebugProcess * process;
+};
+
+struct CorBasicBreakEvent {
+  int type;
+  ICorDebugAppDomain * appDomain;
+  ICorDebugThread * thread;
+};
+
+struct CorBasicBreakpointEvent {
+  int type;
+  ICorDebugAppDomain * appDomain;
+  ICorDebugThread * thread;
+  ICorDebugBreakpoint * breakpoint;
+};
+
+union CorBasicEvent {
+  int type;
+  CorBasicBreakpointEvent breakpoint;
+  CorBasicBreakEvent breakev;
+  CorBasicNewProcessEvent newprocess;
+};
+
+/*
+ *  Event queue with single writer and
+ *  single reader. Writer is debugger callbacks
+ *  and reader is the debugger code which
+ *  wants the next event to poll.
+ */
+#define CORBASIC_EVQUEUE_LEN 32
+struct CorBasicEventQueue {
+  CorBasicEvent queue[CORBASIC_EVQUEUE_LEN];
+  int consumer;
+  int producer;
+  HANDLE conssema;
+  HANDLE prodsema;
+};
+
+CorBasicEventQueue * NewCBEVQueue() {
+  HANDLE csema;
+  HANDLE psema;
+  CorBasicEventQueue * queue = 0;
+
+  csema = CreateSemaphoreA(0, 0, CORBASIC_EVQUEUE_LEN, 0);
+  if(csema) {
+    psema = CreateSemaphoreA(0, CORBASIC_EVQUEUE_LEN, CORBASIC_EVQUEUE_LEN, 0);
+    if(psema) {
+      queue = new CorBasicEventQueue;
+      queue -> consumer = 0;
+      queue -> producer = 0;
+      queue -> conssema = csema;
+      queue -> prodsema = psema;
+    } else
+        CloseHandle(csema);
+  }
+
+  return queue;
+}
+
+void FreeCBEVQueue(CorBasicEventQueue * queue) {
+  delete queue;
+}
+
+void AddEvent(CorBasicEventQueue * queue, CorBasicEvent * ev) {
+  WaitForSingleObject(queue -> prodsema, INFINITE);
+  queue -> queue[queue -> producer] = *ev;
+  queue -> producer += 1;
+  if(queue -> producer >= CORBASIC_EVQUEUE_LEN)
+    queue -> producer = 0;
+  ReleaseSemaphore(queue -> conssema, 1, 0);
+}
+
+void RemoveEvent(CorBasicEventQueue * queue, CorBasicEvent * ev) {
+  DWORD waitstatus = WaitForSingleObject(queue -> conssema, INFINITE);
+  *ev = queue -> queue[queue -> consumer];
+  queue -> consumer += 1;
+  if(queue -> consumer >= CORBASIC_EVQUEUE_LEN)
+    queue -> consumer = 0;
+  ReleaseSemaphore(queue -> prodsema, 1, 0);
+}
+
+int PollEvent(CorBasicEventQueue * queue, CorBasicEvent * ev) {
+  DWORD waitstatus = WaitForSingleObject(queue -> conssema, 0);
+  int evexists = (waitstatus == WAIT_OBJECT_0);
+  if(evexists) {
+    *ev = queue -> queue[queue -> consumer];
+    queue -> consumer += 1;
+    if(queue -> consumer >= CORBASIC_EVQUEUE_LEN)
+      queue -> consumer = 0;
+    ReleaseSemaphore(queue -> prodsema, 1, 0);
+  }
+  return evexists;
+}
+
+struct CorBasicDebugger {
+  ICorDebug * debugger;
+  ICorDebugProcess * process;
+  CorBasicEventQueue * evqueue;
+};
+
+/*
+ * NOTE: From MSDN, all callbacks in this interface are
+ *       serialized and called in the same thread with
+ *       the process in a synchronized state.
+ */
+class CorBasicManagedCallback : ICorDebugManagedCallback2 , ICorDebugManagedCallback {
   private:
   ULONG refcnt;
+  CorBasicEventQueue * queue;
 
   public:
-  CorInteropManagedCallback() {
+  CorBasicManagedCallback(CorBasicEventQueue * q) {
     refcnt = 0;
+    queue = q;
   }
   
   /* IUnknown boilerplate */
@@ -73,7 +187,11 @@ class CorInteropManagedCallback : ICorDebugManagedCallback2 , ICorDebugManagedCa
   }
 
   STDMETHODIMP CreateProcess(ICorDebugProcess * process) {
+    CorBasicEvent ev;
     printf("HI from CreateProcess\n");
+    ev.type = CBEV_NEWPROC;
+    ev.newprocess.process = process;
+    AddEvent(queue, &ev);
     return S_OK;
   }
 
@@ -114,7 +232,6 @@ class CorInteropManagedCallback : ICorDebugManagedCallback2 , ICorDebugManagedCa
 
   STDMETHODIMP ExitProcess(ICorDebugProcess * process) {
     printf("HI from ExitProcess\n");
-    exit(0);
     return S_OK;
   }
 
@@ -219,16 +336,21 @@ class CorInteropManagedCallback : ICorDebugManagedCallback2 , ICorDebugManagedCa
   }
 };
 
-/* Actually, this one isn't so bad. */
-class CorInteropUnmanagedCallback : ICorDebugUnmanagedCallback {
+/*
+ *  NOTE: From MSDN, the unmanaged callbacks are special only
+ *        for the fact that callbacks may be nested
+ *        if managed state is polled. Otherwise, still called
+ *        from the same thread.
+ */
+class CorBasicUnmanagedCallback : ICorDebugUnmanagedCallback {
   private:
   ULONG refcnt;
-  ICorDebugProcess ** pproc;
+  CorBasicEventQueue * queue;
 
   public:
-  CorInteropUnmanagedCallback(ICorDebugProcess ** pproc) {
+  CorBasicUnmanagedCallback(CorBasicEventQueue * q) {
     refcnt = 0;
-    this -> pproc = pproc;
+    queue = q;
   }
   
   /* IUnknown boilerplate */
@@ -256,83 +378,121 @@ class CorInteropUnmanagedCallback : ICorDebugUnmanagedCallback {
 
   STDMETHODIMP DebugEvent(DEBUG_EVENT * debugEvent, BOOL fOutOfBand) {
     printf("HI from DebugEvent\n");
+    
     return S_OK;
   }
 };
 
-#define VERS_MAX_LEN 255
 
-int wmain(int argc, wchar_t *argv[]) {
-  HRESULT comStatus;
-  ULONG len;
+int wstr_startswith(const wchar_t * widestr, const wchar_t * prefix) {
+  while(*widestr && *prefix && *widestr == *prefix)
+    { prefix++; widestr++; }
+  return !*prefix;
+}
+
+#define MAX_VERSION_LEN 63
+ICLRRuntimeInfo * GetRuntimeFromVersion(const wchar_t * runtimeVersion) {
   ICLRMetaHost * host;
   ICLRRuntimeInfo * runtime;
-  ICorDebug * debugger;
-  ICorDebugProcess * proc;
   IEnumUnknown * runtimeEnum;
-  wchar_t versBuffer[VERS_MAX_LEN + 1];
-  wchar_t * vers = L"v4.0.30319";
+  ULONG len;
+  HRESULT comStatus;
+  wchar_t versionBuffer[MAX_VERSION_LEN + 1];
+
+  host = 0;
+  runtime = 0;
+  runtimeEnum = 0;
+
+  if(wcsnlen(runtimeVersion, MAX_VERSION_LEN + 1) < MAX_VERSION_LEN
+     && CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID *)&host) == S_OK
+     && host -> EnumerateInstalledRuntimes(&runtimeEnum) == S_OK) {
+    while((comStatus = runtimeEnum -> Next(1, (IUnknown **)&runtime, &len)) == S_OK) {
+      len = MAX_VERSION_LEN;
+      runtime -> GetVersionString(versionBuffer, &len);
+      if(wstr_startswith(versionBuffer, runtimeVersion))
+        break;
+      runtime -> Release();
+      runtime = 0;
+    }
+    if(comStatus != S_OK)
+      runtime = 0;
+  }
+
+  if(host)
+    host -> Release();
+  if(runtimeEnum)
+    runtimeEnum -> Release();
+
+  return runtime;
+}
+
+ICorDebug * CreateDebuggerFromRuntime(ICLRRuntimeInfo * runtime, CorBasicEventQueue * queue) {
+  HRESULT comStatus;
+  ULONG len;
+  ICorDebug * debugger;
+  ICorDebug * temp;
+
+  debugger = 0;
+  if(runtime -> GetInterface(CLSID_CLRDebuggingLegacy, IID_ICorDebug, (LPVOID *)&temp) == S_OK) {
+    
+    debugger = temp;
+    debugger -> Initialize();
+    debugger -> SetManagedHandler((ICorDebugManagedCallback *)new CorBasicManagedCallback(queue));
+    debugger -> SetUnmanagedHandler((ICorDebugUnmanagedCallback *)new CorBasicUnmanagedCallback(queue));
+  }
+  
+  return debugger;
+}
+
+#define MAX_COMMAND_LEN 32767
+ICorDebugProcess * CreateDebugProcess(ICorDebug * debugger, const wchar_t * commandLine) {
+  ICorDebugProcess * process;
+  ICorDebugProcess * temp;
+  wchar_t commandBuffer[MAX_COMMAND_LEN + 1];
   STARTUPINFOW si;
   PROCESS_INFORMATION pi;
 
-  if(argc != 2) {
-    fprintf(stderr, "Usage: %ls exename\n", argv[0]);
+  process = 0;
+  if(wcsnlen(commandLine, MAX_COMMAND_LEN + 1) < MAX_COMMAND_LEN) {
+    wcsncpy(commandBuffer, commandLine, MAX_COMMAND_LEN);
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    if(debugger -> CreateProcess(0, commandBuffer, 0, 0, 0, CREATE_NEW_CONSOLE, 0, 0, &si, &pi, DEBUG_NO_SPECIAL_OPTIONS, &temp) == S_OK) {
+      CloseHandle(pi.hProcess);
+      CloseHandle(pi.hThread);
+      process = temp;
+    }
+  }
+
+  return process;
+}
+
+int main() {
+  ICLRRuntimeInfo * runtime = GetRuntimeFromVersion(L"v4.0");
+  CorBasicEventQueue * queue = NewCBEVQueue();
+  CorBasicEvent ev;
+  ICorDebug * debugger = CreateDebuggerFromRuntime(runtime, queue);
+  ICorDebugProcess * process = CreateDebugProcess(debugger, L"HelloWorld.exe");
+
+  HANDLE debuggerHandle, duppedHandle;
+  if(process -> GetHandle(&debuggerHandle) != S_OK) {
+    fprintf(stderr, "Get handle failed\n");
+    return -1;  
+  }
+  if(!DuplicateHandle(GetCurrentProcess(), debuggerHandle, GetCurrentProcess(), &duppedHandle, 0, 0, DUPLICATE_SAME_ACCESS)) {
+    fprintf(stderr, "Duplicate failed: %d\n", GetLastError());
     return -1;
   }
 
-  comStatus = CLRCreateInstance(CLSID_CLRMetaHost, IID_ICLRMetaHost, (LPVOID *)&host);
-  if(comStatus != S_OK) {
-    fprintf(stderr, "Failed to get CLR Metadata Host\n");
-    exit(-1);
-  }
-  comStatus = host -> EnumerateInstalledRuntimes(&runtimeEnum);
-  if(comStatus != S_OK) {
-    fprintf(stderr, "Failed to enumerate CLRs\n");
-    exit(-1);
-  }
 
-  runtime = 0;
-  while(runtimeEnum -> Next(1, (IUnknown **)&runtime, &len) == S_OK) {
-    DWORD maxLen = VERS_MAX_LEN;
-    runtime -> GetVersionString(versBuffer, &maxLen);
-    printf("%ls\n", versBuffer);
-    if(wcscmp(versBuffer, vers) == 0)
-      break;
-    runtime -> Release();
-    runtime = 0;
-  }
-  if(!runtime) {
-    fprintf(stderr, "Failed to get %ls runtime\n", vers);
-    exit(-1);
-  }
-
-  comStatus = runtime -> GetInterface(CLSID_CLRDebuggingLegacy, IID_ICorDebug, (LPVOID *)&debugger);
-  if(comStatus != S_OK) {
-    fprintf(stderr, "Failed to create debugger");
-    exit(-1);
-  }
-  debugger -> Initialize();
-  debugger -> SetManagedHandler((ICorDebugManagedCallback *)new CorInteropManagedCallback());
-  debugger -> SetUnmanagedHandler((ICorDebugUnmanagedCallback *)new CorInteropUnmanagedCallback(&proc));  
-
-  runtimeEnum -> Release();
-  runtime -> Release();
-  host -> Release();
-
-  ZeroMemory(&si, sizeof(si));
-  ZeroMemory(&pi, sizeof(pi));
-  si.cb = sizeof(si);
-
-  comStatus = debugger -> CreateProcess(0, argv[1], 0, 0, 0, CREATE_NEW_CONSOLE, 0, 0, &si, &pi, DEBUG_NO_SPECIAL_OPTIONS, &proc);
-  if(comStatus != S_OK) {
-    fprintf(stderr, "Failed to create process. Error code: %lx\n", comStatus);
-    exit(-1);
-  }
-
-  /* Run this. Don't you wish VS debugger was this fast? */
   while(1) {
-    proc -> Continue(0);
-  }
+    DWORD waitstatus;
+    process -> Continue(0);
 
+    waitstatus = WaitForSingleObject(duppedHandle, 0);
+    if(waitstatus == WAIT_OBJECT_0)
+      break;
+  }
   return 0;
 }

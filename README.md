@@ -1,3 +1,3 @@
-# DotPwn
+# yamd
 
-Tools to pwn Windows executables, both managed and unmanaged
+Yet another mixed code debugger for .NET/Win32
